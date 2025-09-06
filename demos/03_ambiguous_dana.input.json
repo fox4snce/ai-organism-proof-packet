@@ -1,0 +1,11 @@
+{
+  "obligations": [
+    {"type": "ACHIEVE", "payload": {
+      "state":"plan", "kind":"plan", "mode":"planning",
+      "goal": {"predicate":"event.scheduled","args":{"person":"Dana","time":"2025-09-06T13:00-07:00"}},
+      "budgets": {"max_depth":3, "beam":3, "time_ms":150},
+      "simulate_ambiguous": true
+    }}
+  ]
+}
+

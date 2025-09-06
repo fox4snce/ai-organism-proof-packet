@@ -1,0 +1,14 @@
+{
+  "obligations": [
+    {"type": "REPORT", "payload": {
+      "kind":"logic", "mode":"deduction", "domains":["kinship"],
+      "query": {"predicate":"grandparentOf","args":["Alice","Cara"]},
+      "facts": [
+        {"predicate":"parentOf","args":["Alice","Bob"]},
+        {"predicate":"parentOf","args":["Bob","Cara"]}
+      ],
+      "budgets": {"max_depth":3, "beam":4, "time_ms":100}
+    }}
+  ]
+}
+

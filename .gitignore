@@ -125,3 +125,7 @@ cython_debug/
 # IDEs/editors
 .vscode/
 .idea/
+
+# Proof Packet runtime outputs
+runs/*
+!runs/.gitkeep

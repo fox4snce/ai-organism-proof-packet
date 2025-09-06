@@ -1,0 +1,14 @@
+{
+  "obligations": [
+    {"type": "ACHIEVE", "payload": {
+      "state":"plan", "kind":"plan", "mode":"planning",
+      "goal": {"predicate":"event.scheduled","args":{"person":"Dana","time":"2025-09-06T13:00-07:00"}},
+      "guardrails": [
+        {"type":"MAINTAIN", "predicate":"calendar.free", "args":["Dana", {"start":"2025-09-06T09:00-07:00","end":"2025-09-06T17:00-07:00"}]},
+        {"type":"AVOID", "predicate":"double_book", "args":["Dana","2025-09-06T13:00-07:00"]}
+      ],
+      "budgets": {"max_depth":3, "beam":3, "time_ms":150}
+    }}
+  ]
+}
+

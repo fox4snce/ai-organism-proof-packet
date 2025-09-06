@@ -1,0 +1,211 @@
+#!/usr/bin/env python
+import argparse, os, sys, json, time, hashlib, concurrent.futures as cf
+import glob
+from pathlib import Path
+import requests
+try:
+    from jsonschema import validate
+except Exception:
+    validate = None
+
+CONFIG = {
+    "engine_url": "http://127.0.0.1:8000",
+    "schemas": {
+        "obligation": "schemas/obligation.schema.json",
+        "trace": "schemas/trace.schema.json",
+    },
+    "compare": {"ignore_fields": []}
+}
+
+# --- utils ---
+
+def load_config():
+    p = Path("config/packet.yaml")
+    if p.exists():
+        import yaml
+        data = yaml.safe_load(p.read_text())
+        # shallow merge
+        for k, v in data.items():
+            if isinstance(v, dict) and k in CONFIG:
+                CONFIG[k].update(v)
+            else:
+                CONFIG[k] = v
+
+
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def strip_ignored_fields(obj, ignore_paths):
+    # Supports simple dot-paths like a.b.c
+    for path in ignore_paths:
+        parts = path.split('.')
+        cur = obj
+        for i, part in enumerate(parts):
+            if isinstance(cur, dict) and part in cur:
+                if i == len(parts) - 1:
+                    cur[part] = None
+                else:
+                    cur = cur[part]
+            else:
+                break
+    return obj
+
+
+def expand_input_files(inputs):
+    expanded = []
+    for item in inputs:
+        p = Path(item)
+        # If directory, take *.json within
+        if p.exists() and p.is_dir():
+            expanded.extend(sorted(p.glob('*.json')))
+            continue
+        # If explicit file exists
+        if p.exists() and p.is_file():
+            expanded.append(p)
+            continue
+        # Otherwise treat as glob pattern (PowerShell won't expand for Python)
+        for g in sorted(glob.glob(item)):
+            if g.lower().endswith('.json'):
+                expanded.append(Path(g))
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for e in expanded:
+        s = str(e.resolve())
+        if s in seen:
+            continue
+        seen.add(s)
+        unique.append(e)
+    return unique
+
+def post_execute(obligation_json):
+    url = CONFIG["engine_url"].rstrip('/') + "/v1/obligations/execute"
+    r = requests.post(url, json=obligation_json, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def validate_json(instance, schema_path):
+    if validate is None:
+        return True
+    import json
+    from jsonschema import validate as _validate
+    schema = json.load(open(schema_path, 'r', encoding='utf-8'))
+    _validate(instance=instance, schema=schema)
+    return True
+
+# --- commands ---
+
+def cmd_run(args):
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    load_config()
+
+    files = expand_input_files(args.files)
+    if not files:
+        print('No input files matched.')
+        sys.exit(2)
+
+    successes = 0
+    for demo_path in files:
+        name = Path(demo_path).stem
+        with open(demo_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        # optional: validate input against schema
+        if Path(CONFIG['schemas']['obligation']).exists():
+            validate_json(payload, CONFIG['schemas']['obligation'])
+        resp = post_execute(payload)
+        if Path(CONFIG['schemas']['trace']).exists():
+            validate_json(resp, CONFIG['schemas']['trace'])
+        # normalize ignored fields
+        resp = strip_ignored_fields(resp, CONFIG['compare']['ignore_fields'])
+        out_path = out / f"{name}.trace.json"
+        out_path.write_text(json.dumps(resp, ensure_ascii=False, separators=(',',':')), encoding='utf-8')
+        successes += 1
+        print(f"[OK] {name}")
+    print(f"Done. {successes}/{len(files)} demos written to {out}")
+
+
+def cmd_verify(args):
+    load_config()
+    runs, gold = Path(args.runs), Path(args.golden)
+    failures = 0
+    candidates = list(runs.glob("*.trace.json")) + list(runs.glob("*.json"))
+    by_base = {}
+    for p in candidates:
+        base = p.name.replace('.trace.json','').replace('.json','')
+        # Prefer explicit .trace.json over .json if both exist
+        if base not in by_base or str(p).endswith('.trace.json'):
+            by_base[base] = p
+    files = sorted(by_base.items(), key=lambda kv: kv[0])
+    for base, run_file in files:
+        gold_file = (gold / f"{base}.trace.json")
+        if not gold_file.exists():
+            print(f"[MISS] golden not found for {base}")
+            failures += 1
+            continue
+        rb = run_file.read_bytes()
+        gb = gold_file.read_bytes()
+        # hashes
+        rh, gh = sha256_bytes(rb), sha256_bytes(gb)
+        if rh != gh:
+            print(f"[DIFF] {base}: run={rh} gold={gh}")
+            failures += 1
+        else:
+            print(f"[OK]   {base}")
+    if failures:
+        print(f"FAIL: {failures} mismatches"); sys.exit(1)
+    print("All traces match goldens.")
+
+
+def cmd_bench(args):
+    load_config()
+    demo_files = sorted(Path('demos').glob('*.json'))
+    if not demo_files:
+        print('No demos found.'); sys.exit(2)
+
+    def one(name_payload):
+        name, payload = name_payload
+        t0 = time.perf_counter()
+        _ = post_execute(payload)
+        return (name, (time.perf_counter()-t0)*1000.0)
+
+    batch = [(p.stem, json.loads(Path(p).read_text())) for p in demo_files]
+    latencies = []
+    with cf.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+        futs = [ex.submit(one, item) for item in batch*max(1, args.repeat)]
+        for fut in cf.as_completed(futs):
+            _, ms = fut.result()
+            latencies.append(ms)
+    latencies.sort()
+    def pct(p):
+        k = int((p/100.0)*(len(latencies)-1))
+        return latencies[k]
+    p50, p95 = pct(50), pct(95)
+    print(json.dumps({"concurrency": args.concurrency, "repeat": args.repeat, "p50_ms": p50, "p95_ms": p95, "n": len(latencies)}, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='pp', description='Proof Packet runner')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+
+    ap_run = sub.add_parser('run');
+    ap_run.add_argument('files', nargs='+', help='demo input JSON files')
+    ap_run.add_argument('--out', default='runs/', help='output folder')
+    ap_run.set_defaults(func=cmd_run)
+
+    ap_verify = sub.add_parser('verify');
+    ap_verify.add_argument('runs'); ap_verify.add_argument('golden')
+    ap_verify.set_defaults(func=cmd_verify)
+
+    ap_bench = sub.add_parser('bench');
+    ap_bench.add_argument('--concurrency', type=int, default=32)
+    ap_bench.add_argument('--repeat', type=int, default=4)
+    ap_bench.set_defaults(func=cmd_bench)
+
+    args = ap.parse_args(); args.func(args)
+
+if __name__ == '__main__':
+    main()
+
