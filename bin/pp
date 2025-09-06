@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 import argparse, os, sys, json, time, hashlib, concurrent.futures as cf
 import glob
+import platform
+import zipfile
+from typing import Any, Dict, List, Tuple
 from pathlib import Path
 import requests
 try:
@@ -30,6 +33,10 @@ def load_config():
                 CONFIG[k].update(v)
             else:
                 CONFIG[k] = v
+    # Env override for engine URL
+    env_url = os.environ.get('PP_ENGINE_URL')
+    if env_url:
+        CONFIG['engine_url'] = env_url
 
 
 def sha256_bytes(b: bytes) -> str:
@@ -37,18 +44,50 @@ def sha256_bytes(b: bytes) -> str:
 
 
 def strip_ignored_fields(obj, ignore_paths):
-    # Supports simple dot-paths like a.b.c
-    for path in ignore_paths:
-        parts = path.split('.')
-        cur = obj
-        for i, part in enumerate(parts):
-            if isinstance(cur, dict) and part in cur:
-                if i == len(parts) - 1:
-                    cur[part] = None
+    # Supports paths like a.b.c and wildcards for arrays/dicts with '*' or '[]': e.g., assertions[].id
+    def apply(o, parts, idx):
+        if idx >= len(parts):
+            return o
+        token = parts[idx]
+        is_last = (idx == len(parts) - 1)
+        if isinstance(o, dict):
+            if token in ('*', '[]'):
+                for k in list(o.keys()):
+                    if is_last:
+                        o[k] = None
+                    else:
+                        apply(o.get(k), parts, idx + 1)
+            elif token in o:
+                if is_last:
+                    o[token] = None
                 else:
-                    cur = cur[part]
+                    apply(o[token], parts, idx + 1)
+        elif isinstance(o, list):
+            if token in ('*', '[]'):
+                for i in range(len(o)):
+                    if is_last:
+                        o[i] = None
+                    else:
+                        apply(o[i], parts, idx + 1)
+        return o
+
+    for path in ignore_paths:
+        raw_parts = [p for p in str(path).split('.') if p]
+        parts = []
+        for tok in raw_parts:
+            if tok.endswith('[]'):
+                base = tok[:-2]
+                if base:
+                    parts.append(base)
+                parts.append('[]')
+            elif tok.endswith('[*]'):
+                base = tok[:-3]
+                if base:
+                    parts.append(base)
+                parts.append('[]')
             else:
-                break
+                parts.append(tok)
+        apply(obj, parts, 0)
     return obj
 
 
@@ -78,6 +117,155 @@ def expand_input_files(inputs):
         seen.add(s)
         unique.append(e)
     return unique
+
+
+def compute_build_meta() -> Dict[str, Any]:
+    py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    mach = platform.machine().lower()
+    if sys.platform.startswith('win'):
+        plat = f"win-{ 'amd64' if mach in ('amd64','x86_64') else mach }"
+    elif sys.platform.startswith('linux'):
+        plat = f"linux-{mach}"
+    elif sys.platform.startswith('darwin'):
+        plat = f"macos-{mach}"
+    else:
+        plat = f"{sys.platform}-{mach}"
+    meta = {
+        "engine_commit": os.environ.get('PP_ENGINE_COMMIT') or os.environ.get('ENGINE_COMMIT') or "unknown",
+        "engine_version": os.environ.get('PP_ENGINE_VERSION') or os.environ.get('ENGINE_VERSION') or "unknown",
+        "schema_version": os.environ.get('PP_SCHEMA_VERSION') or os.environ.get('SCHEMA_VERSION') or "unknown",
+        "python": py,
+        "platform": plat,
+    }
+    return meta
+
+
+def attach_meta(trace_obj: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(trace_obj, dict):
+        return trace_obj
+    meta = compute_build_meta()
+    existing = trace_obj.get('meta') or {}
+    if not isinstance(existing, dict):
+        existing = {}
+    existing.update({k: v for k, v in meta.items() if v is not None})
+    trace_obj['meta'] = existing
+    return trace_obj
+
+
+def _first_diff_path(a: Any, b: Any, path: str = "") -> str:
+    if type(a) != type(b):
+        return path or "/"
+    if isinstance(a, dict):
+        keys = sorted(set(a.keys()) | set(b.keys()))
+        for k in keys:
+            ak, bk = a.get(k, object()), b.get(k, object())
+            if ak is object() or bk is object():
+                return f"{path}/{k}"
+            sub = _first_diff_path(ak, bk, f"{path}/{k}")
+            if sub:
+                return sub
+        return ""
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return f"{path}/len"
+        for i, (ai, bi) in enumerate(zip(a, b)):
+            sub = _first_diff_path(ai, bi, f"{path}/{i}")
+            if sub:
+                return sub
+        return ""
+    if a != b:
+        return path or "/"
+    return ""
+
+
+def _prune_for_compare(obj: Any) -> Any:
+    # Remove keys with None and empty dicts recursively (lists preserved)
+    if isinstance(obj, dict):
+        keys = list(obj.keys())
+        for k in keys:
+            v = _prune_for_compare(obj[k])
+            if v is None:
+                obj.pop(k, None)
+            elif isinstance(v, dict) and len(v) == 0:
+                obj.pop(k, None)
+            else:
+                obj[k] = v
+        return obj
+    if isinstance(obj, list):
+        return [ _prune_for_compare(x) for x in obj ]
+    return obj
+
+
+def _walk_find_key(obj: Any, key: str) -> List[Any]:
+    found: List[Any] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == key:
+                found.append(v)
+            found.extend(_walk_find_key(v, key))
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(_walk_find_key(item, key))
+    return found
+
+
+def _any_status_failed(obj: Any) -> bool:
+    vals = _walk_find_key(obj, 'status')
+    return any((isinstance(v, str) and v.lower() == 'failed') for v in vals)
+
+
+def _has_nonempty_key(obj: Any, key: str) -> bool:
+    vals = _walk_find_key(obj, key)
+    for v in vals:
+        if isinstance(v, (list, dict)) and len(v) > 0:
+            return True
+        if isinstance(v, str) and v.strip():
+            return True
+    return False
+
+
+def _invariant_checks(base_name: str, obj: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    errors: List[str] = []
+    # 1) Logic demo: rules_fired non-empty
+    if 'grandparent' in base_name:
+        if not _has_nonempty_key(obj, 'rules_fired'):
+            errors.append("rules_fired should be non-empty for logic demo")
+    # 2) Planning demo: plan steps present and no assertions
+    if 'plan_meeting' in base_name:
+        has_steps = _has_nonempty_key(obj, 'plan_steps')
+        if not has_steps:
+            # try tool_runs[].outputs.trajectory.steps
+            try:
+                tr = obj.get('tool_runs', [])
+                if isinstance(tr, list):
+                    for t in tr:
+                        steps = (((t or {}).get('outputs') or {}).get('trajectory') or {}).get('steps')
+                        if isinstance(steps, list) and steps:
+                            has_steps = True
+                            break
+            except Exception:
+                pass
+        if not has_steps:
+            errors.append("planning demo must contain non-empty steps")
+        if not isinstance(obj.get('assertions', []), list) or len(obj.get('assertions', [])) != 0:
+            errors.append("planning demo must not write assertions")
+    # 3) Guardrails demo: status failed and non-empty justification
+    if 'guardrails' in base_name:
+        if not _any_status_failed(obj):
+            errors.append("guardrails demo must have status:'failed'")
+        if not _has_nonempty_key(obj, 'justification'):
+            errors.append("guardrails demo must include non-empty justification")
+    # 4) Derived assertions proof metadata
+    assertions = obj.get('assertions', [])
+    if isinstance(assertions, list):
+        for idx, a in enumerate(assertions):
+            if not isinstance(a, dict):
+                continue
+            is_derived = bool(a.get('derived')) or (a.get('kind') == 'derived') or (a.get('origin') == 'rule')
+            if is_derived:
+                if 'proof_ref' not in a or 'rule_version' not in a:
+                    errors.append(f"assertion[{idx}] missing proof_ref or rule_version")
+    return (len(errors) == 0, errors)
 
 def post_execute(obligation_json):
     url = CONFIG["engine_url"].rstrip('/') + "/v1/obligations/execute"
@@ -115,13 +303,37 @@ def cmd_run(args):
         # optional: validate input against schema
         if Path(CONFIG['schemas']['obligation']).exists():
             validate_json(payload, CONFIG['schemas']['obligation'])
+
+        # First run
         resp = post_execute(payload)
         if Path(CONFIG['schemas']['trace']).exists():
             validate_json(resp, CONFIG['schemas']['trace'])
-        # normalize ignored fields
         resp = strip_ignored_fields(resp, CONFIG['compare']['ignore_fields'])
+        resp = attach_meta(resp)
+        serialized = json.dumps(resp, ensure_ascii=False, separators=(',',':'))
+        base_hash = sha256_bytes(serialized.encode('utf-8'))
+
+        # Repeat determinism check
+        if getattr(args, 'repeat', 1) and args.repeat > 1:
+            for i in range(1, args.repeat):
+                r2 = post_execute(payload)
+                r2 = strip_ignored_fields(r2, CONFIG['compare']['ignore_fields'])
+                r2 = attach_meta(r2)
+                s2 = json.dumps(r2, ensure_ascii=False, separators=(',',':'))
+                h2 = sha256_bytes(s2.encode('utf-8'))
+                if h2 != base_hash:
+                    try:
+                        j1 = json.loads(serialized)
+                        j2 = json.loads(s2)
+                        diff_path = _first_diff_path(j1, j2) or '/'
+                    except Exception:
+                        diff_path = '/'
+                    print(f"[DIFF-RUNS] {name}: mismatch on repeat at {diff_path}")
+                    sys.exit(3)
+
+        # write
         out_path = out / f"{name}.trace.json"
-        out_path.write_text(json.dumps(resp, ensure_ascii=False, separators=(',',':')), encoding='utf-8')
+        out_path.write_text(serialized, encoding='utf-8')
         successes += 1
         print(f"[OK] {name}")
     print(f"Done. {successes}/{len(files)} demos written to {out}")
@@ -131,7 +343,11 @@ def cmd_verify(args):
     load_config()
     runs, gold = Path(args.runs), Path(args.golden)
     failures = 0
-    candidates = list(runs.glob("*.trace.json")) + list(runs.glob("*.json"))
+    # Only compare trace artifacts, ignore other JSON like bench_*.json
+    candidates = list(runs.glob("*.trace.json"))
+    if not candidates:
+        print("No trace files found to verify.")
+        sys.exit(2)
     by_base = {}
     for p in candidates:
         base = p.name.replace('.trace.json','').replace('.json','')
@@ -139,24 +355,64 @@ def cmd_verify(args):
         if base not in by_base or str(p).endswith('.trace.json'):
             by_base[base] = p
     files = sorted(by_base.items(), key=lambda kv: kv[0])
+    compared_count = 0
+    skipped_count = len(list(Path(args.runs).glob('*.json'))) - len(candidates)
+
+    # Strict mode: require the same set of names in runs and golden
+    if getattr(args, 'strict', False):
+        run_names = set([b for b, _ in files])
+        gold_names = set([p.stem.replace('.trace','') for p in Path(args.golden).glob('*.trace.json')])
+        missing_in_runs = sorted(list(gold_names - run_names))
+        missing_in_gold = sorted(list(run_names - gold_names))
+        if missing_in_runs or missing_in_gold:
+            if missing_in_runs:
+                print("[STRICT] Missing in runs:", ", ".join(missing_in_runs))
+            if missing_in_gold:
+                print("[STRICT] Missing in golden:", ", ".join(missing_in_gold))
+            sys.exit(2)
+
     for base, run_file in files:
         gold_file = (gold / f"{base}.trace.json")
         if not gold_file.exists():
             print(f"[MISS] golden not found for {base}")
             failures += 1
             continue
-        rb = run_file.read_bytes()
-        gb = gold_file.read_bytes()
-        # hashes
+        try:
+            jrun_raw = json.loads(run_file.read_text(encoding='utf-8'))
+            jgold_raw = json.loads(gold_file.read_text(encoding='utf-8'))
+        except Exception as e:
+            print(f"[ERR] {base}: failed to read JSON: {e}")
+            failures += 1
+            continue
+
+        # Normalize by stripping ignored fields for compare-only
+        jrun = json.loads(json.dumps(jrun_raw))
+        jgold = json.loads(json.dumps(jgold_raw))
+        strip_ignored_fields(jrun, CONFIG['compare']['ignore_fields'])
+        strip_ignored_fields(jgold, CONFIG['compare']['ignore_fields'])
+        jrun = _prune_for_compare(jrun)
+        jgold = _prune_for_compare(jgold)
+        rb = json.dumps(jrun, ensure_ascii=False, separators=(',',':')).encode('utf-8')
+        gb = json.dumps(jgold, ensure_ascii=False, separators=(',',':')).encode('utf-8')
         rh, gh = sha256_bytes(rb), sha256_bytes(gb)
         if rh != gh:
-            print(f"[DIFF] {base}: run={rh} gold={gh}")
+            diff_path = _first_diff_path(jrun, jgold) or '/'
+            print(f"[DIFF] {base}: run={rh} gold={gh} first_diff={diff_path}")
             failures += 1
         else:
             print(f"[OK]   {base}")
+        compared_count += 1
+        # Invariant checks (run on actual run JSON)
+        ok, errs = _invariant_checks(base, jrun_raw)
+        if not ok:
+            for e in errs:
+                print(f"[INV] {base}: {e}")
+            failures += 1
     if failures:
+        print(f"verify summary: compared={compared_count}, skipped_non_trace={skipped_count}")
         print(f"FAIL: {failures} mismatches"); sys.exit(1)
     print("All traces match goldens.")
+    print(f"verify summary: compared={compared_count}, skipped_non_trace={skipped_count}")
 
 
 def cmd_bench(args):
@@ -183,7 +439,33 @@ def cmd_bench(args):
         k = int((p/100.0)*(len(latencies)-1))
         return latencies[k]
     p50, p95 = pct(50), pct(95)
-    print(json.dumps({"concurrency": args.concurrency, "repeat": args.repeat, "p50_ms": p50, "p95_ms": p95, "n": len(latencies)}, indent=2))
+    result = {"concurrency": args.concurrency, "repeat": args.repeat, "p50_ms": p50, "p95_ms": p95, "n": len(latencies)}
+    out = json.dumps(result, indent=2)
+    save_path = args.save
+    if not save_path:
+        Path('artifacts/bench').mkdir(parents=True, exist_ok=True)
+        save_path = f"artifacts/bench/bench_{args.concurrency}.json"
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(save_path).write_text(out, encoding='utf-8')
+    print(out)
+
+
+def cmd_bundle(args):
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+        def add_path(p: Path):
+            if p.is_file():
+                z.write(p, p.as_posix())
+        for folder in [Path('golden'), Path('runs'), Path('config')]:
+            if folder.exists():
+                for root, _, files in os.walk(folder):
+                    for f in files:
+                        add_path(Path(root) / f)
+        # top-level bench files if any
+        for p in Path('.').glob('bench_*.json'):
+            add_path(p)
+        print(f"Wrote bundle: {out_path}")
 
 
 def main():
@@ -193,6 +475,7 @@ def main():
     ap_run = sub.add_parser('run');
     ap_run.add_argument('files', nargs='+', help='demo input JSON files')
     ap_run.add_argument('--out', default='runs/', help='output folder')
+    ap_run.add_argument('--repeat', type=int, default=1, help='repeat each input and assert deterministic output')
     ap_run.set_defaults(func=cmd_run)
 
     ap_verify = sub.add_parser('verify');
@@ -202,7 +485,17 @@ def main():
     ap_bench = sub.add_parser('bench');
     ap_bench.add_argument('--concurrency', type=int, default=32)
     ap_bench.add_argument('--repeat', type=int, default=4)
+    ap_bench.add_argument('--save', help='optional file to write JSON results to')
     ap_bench.set_defaults(func=cmd_bench)
+
+    ap_bundle = sub.add_parser('bundle');
+    ap_bundle.add_argument('--output', default='artifacts/proof_packet.zip')
+    ap_bundle.set_defaults(func=cmd_bundle)
+
+    # verify options
+    for p in sub._name_parser_map.values():
+        if p.prog.endswith(' verify'):
+            p.add_argument('--strict', action='store_true', help='require runs/ and golden/ contain the same case names')
 
     args = ap.parse_args(); args.func(args)
 

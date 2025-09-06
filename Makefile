@@ -16,3 +16,15 @@ bench:
 clean:
 	rm -rf runs/*
 
+.PHONY: ci
+ci:
+	@$(PP) run demos/*.json --out runs/
+	@$(PP) verify runs/ golden/
+	@$(PP) bench --concurrency 32
+	@$(PP) bench --concurrency 128
+
+.PHONY: goldens
+goldens:
+	@$(PP) run demos/*.json --out runs/
+	@$(PP) verify runs/ golden/
+
