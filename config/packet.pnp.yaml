@@ -1,0 +1,27 @@
+engine_url: "http://127.0.0.1:8000"
+engine:
+  headers:
+    X-Engine-DB: "pnp.db"
+  query:
+    db: "pnp.db"
+schemas:
+  obligation: "schemas/obligation.schema.json"
+  trace: "schemas/trace.schema.json"
+compare:
+  ignore_fields:
+    - "meta.engine_commit"
+    - "meta.engine_version"
+    - "meta.schema_version"
+    - "meta.python"
+    - "meta.platform"
+    - "trace_id"
+    - "timestamp"
+    - "obligations[].id"
+    - "tool_runs[].id"
+    - "assertions[].id"
+    - "assertions[].proof_ref"
+    - "assertions[].rule_version"
+    - "metrics.*"
+    - "verification.duration_ms"
+    - "tool_runs[].duration_ms"
+    - "tool_runs[].outputs.trajectory.metrics.*"

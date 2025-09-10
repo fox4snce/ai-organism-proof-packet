@@ -11,19 +11,21 @@ try:
 except Exception:
     validate = None
 
-CONFIG = {
+CONFIG: Dict[str, Any] = {
     "engine_url": "http://127.0.0.1:8000",
     "schemas": {
         "obligation": "schemas/obligation.schema.json",
         "trace": "schemas/trace.schema.json",
     },
-    "compare": {"ignore_fields": []}
+    "compare": {"ignore_fields": []},
+    "engine": {"headers": {}, "query": {}}
 }
+CONFIG_FILE = "config/packet.yaml"
 
 # --- utils ---
 
 def load_config():
-    p = Path("config/packet.yaml")
+    p = Path(CONFIG_FILE)
     if p.exists():
         import yaml
         data = yaml.safe_load(p.read_text())
@@ -269,7 +271,14 @@ def _invariant_checks(base_name: str, obj: Dict[str, Any]) -> Tuple[bool, List[s
 
 def post_execute(obligation_json):
     url = CONFIG["engine_url"].rstrip('/') + "/v1/obligations/execute"
-    r = requests.post(url, json=obligation_json, timeout=30)
+    # Build headers/query from config + env overrides
+    headers = dict(CONFIG.get('engine', {}).get('headers', {}) or {})
+    params = dict(CONFIG.get('engine', {}).get('query', {}) or {})
+    db = os.environ.get('PP_ENGINE_DB')
+    if db:
+        headers.setdefault('X-Engine-DB', db)
+        params.setdefault('db', db)
+    r = requests.post(url, json=obligation_json, headers=headers, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -470,12 +479,14 @@ def cmd_bundle(args):
 
 def main():
     ap = argparse.ArgumentParser(prog='pp', description='Proof Packet runner')
+    ap.add_argument('--config', default='config/packet.yaml', help='path to config YAML')
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     ap_run = sub.add_parser('run');
     ap_run.add_argument('files', nargs='+', help='demo input JSON files')
     ap_run.add_argument('--out', default='runs/', help='output folder')
     ap_run.add_argument('--repeat', type=int, default=1, help='repeat each input and assert deterministic output')
+    ap_run.add_argument('--config', help='path to config YAML (overrides global)')
     ap_run.set_defaults(func=cmd_run)
 
     ap_verify = sub.add_parser('verify');
@@ -486,18 +497,25 @@ def main():
     ap_bench.add_argument('--concurrency', type=int, default=32)
     ap_bench.add_argument('--repeat', type=int, default=4)
     ap_bench.add_argument('--save', help='optional file to write JSON results to')
+    ap_bench.add_argument('--config', help='path to config YAML (overrides global)')
     ap_bench.set_defaults(func=cmd_bench)
 
     ap_bundle = sub.add_parser('bundle');
     ap_bundle.add_argument('--output', default='artifacts/proof_packet.zip')
+    ap_bundle.add_argument('--config', help='path to config YAML (overrides global)')
     ap_bundle.set_defaults(func=cmd_bundle)
 
     # verify options
     for p in sub._name_parser_map.values():
         if p.prog.endswith(' verify'):
             p.add_argument('--strict', action='store_true', help='require runs/ and golden/ contain the same case names')
+            p.add_argument('--config', help='path to config YAML (overrides global)')
 
-    args = ap.parse_args(); args.func(args)
+    args = ap.parse_args()
+    global CONFIG_FILE
+    chosen = getattr(args, 'config', None) or 'config/packet.yaml'
+    CONFIG_FILE = chosen
+    args.func(args)
 
 if __name__ == '__main__':
     main()

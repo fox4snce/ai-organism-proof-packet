@@ -129,3 +129,5 @@ cython_debug/
 # Proof Packet runtime outputs
 runs/*
 !runs/.gitkeep
+runs_pnp/*
+!runs_pnp/.gitkeep
